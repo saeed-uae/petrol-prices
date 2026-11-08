@@ -1,0 +1,51 @@
+name: تحديث الأسعار
+description: أسعار البترول للشهر الجديد
+title: "أسعار جديدة"
+body:
+  - type: dropdown
+    id: month
+    attributes:
+      label: الشهر
+      options:
+        - يناير
+        - فبراير
+        - مارس
+        - أبريل
+        - مايو
+        - يونيو
+        - يوليو
+        - أغسطس
+        - سبتمبر
+        - أكتوبر
+        - نوفمبر
+        - ديسمبر
+    validations:
+      required: true
+  - type: input
+    id: super98
+    attributes:
+      label: سوبر 98
+      placeholder: "4.16"
+    validations:
+      required: true
+  - type: input
+    id: special95
+    attributes:
+      label: خصوصي 95
+      placeholder: "4.04"
+    validations:
+      required: true
+  - type: input
+    id: eplus91
+    attributes:
+      label: إي بلس 91
+      placeholder: "3.97"
+    validations:
+      required: true
+  - type: input
+    id: diesel
+    attributes:
+      label: ديزل
+      placeholder: "4.75"
+    validations:
+      required: true
