@@ -1,0 +1,97 @@
+name: Notify new prices
+
+on:
+  push:
+    paths:
+      - prices.json
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install tools
+        run: pip install google-auth requests
+
+      - name: Send notification
+        env:
+          FIREBASE_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python3 -u - <<'EOF'
+          import json, os, subprocess, sys, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+
+          new = json.load(open("prices.json", encoding="utf-8"))
+          try:
+              old = json.loads(subprocess.check_output(["git", "show", "HEAD~1:prices.json"]).decode("utf-8"))
+          except Exception:
+              old = {}
+
+          if os.environ.get("EVENT") != "workflow_dispatch" and old.get("month") == new.get("month"):
+              print("Same month, no notification")
+              sys.exit(0)
+
+          AR_DIGITS = str.maketrans("0123456789.", "٠١٢٣٤٥٦٧٨٩٫")
+          AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"]
+          EN_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+          FUELS = [("super98","سوبر 98","Super 98"), ("special95","خصوصي 95","Special 95"),
+                   ("eplus91","إي بلس 91","E-Plus 91"), ("diesel","ديزل","Diesel")]
+
+          month_ar = new["month"]
+          month_en = month_ar
+          for a, e in zip(AR_MONTHS, EN_MONTHS):
+              month_en = month_en.replace(a, e)
+
+          downs = ups = 0
+          ar_parts, en_parts = [], []
+          for key, name_ar, name_en in FUELS:
+              price = new[key]
+              prev = new.get("prev_" + key)
+              arrow = ""
+              if prev is not None:
+                  if price < prev:
+                      arrow, downs = " ▼", downs + 1
+                  elif price > prev:
+                      arrow, ups = " ▲", ups + 1
+              p = f"{price:.2f}"
+              ar_parts.append(f"{name_ar}: {p}{arrow}".translate(AR_DIGITS))
+              en_parts.append(f"{name_en}: {p}{arrow}")
+
+          m_ar = month_ar.translate(AR_DIGITS)
+          if downs == 4:
+              title_ar, title_en = f"📉 أسعار {m_ar} نزلت!", f"📉 {month_en} prices are down!"
+          elif ups == 4:
+              title_ar, title_en = f"📈 أسعار {m_ar} ارتفعت", f"📈 {month_en} prices are up"
+          else:
+              title_ar, title_en = f"⛽ أسعار {m_ar} صدرت", f"⛽ {month_en} prices are out"
+
+          messages = [
+              ("prices_ar", title_ar, " • ".join(ar_parts)),
+              ("prices_en", title_en, " • ".join(en_parts)),
+          ]
+
+          info = json.loads(os.environ["FIREBASE_KEY"])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+          creds.refresh(Request())
+          url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
+
+          for topic, title, body in messages:
+              r = requests.post(url, timeout=30,
+                  headers={"Authorization": "Bearer " + creds.token},
+                  json={"message": {
+                      "topic": topic,
+                      "notification": {"title": title, "body": body},
+                      "android": {"priority": "HIGH", "notification": {"channel_id": "prices"}}
+                  }})
+              print(topic, r.status_code, r.text)
+              r.raise_for_status()
+          print("Done ✅")
+          EOF
