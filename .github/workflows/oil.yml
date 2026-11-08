@@ -11,19 +11,29 @@ permissions:
 jobs:
   oil:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Get Brent price and build forecast
         run: |
-          python3 - <<'EOF'
+          python3 -u - <<'EOF'
           import csv, io, json, time, datetime, urllib.request
 
           UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 
-          def get(url, timeout=120):
+          def get(url):
               req = urllib.request.Request(url, headers=UA)
-              return urllib.request.urlopen(req, timeout=timeout).read().decode()
+              return urllib.request.urlopen(req, timeout=30).read().decode()
+
+          def from_yahoo():
+              text = get("https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?range=6mo&interval=1d")
+              res = json.loads(text)["chart"]["result"][0]
+              rows = []
+              for ts, v in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]):
+                  if v is not None:
+                      rows.append((datetime.datetime.utcfromtimestamp(ts).date(), float(v)))
+              return rows
 
           def from_fred():
               text = get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU")
@@ -37,25 +47,17 @@ jobs:
                       continue
               return rows
 
-          def from_yahoo():
-              text = get("https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?range=6mo&interval=1d")
-              res = json.loads(text)["chart"]["result"][0]
-              rows = []
-              for ts, v in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]):
-                  if v is not None:
-                      rows.append((datetime.datetime.utcfromtimestamp(ts).date(), float(v)))
-              return rows
-
           rows, source = [], ""
-          for name, fn in [("FRED", from_fred), ("FRED", from_fred), ("FRED", from_fred), ("Yahoo", from_yahoo), ("Yahoo", from_yahoo)]:
+          for name, fn in [("Yahoo", from_yahoo), ("Yahoo", from_yahoo), ("FRED", from_fred), ("FRED", from_fred)]:
               try:
                   rows = fn()
                   if len(rows) > 30:
                       source = name
+                      print("Got data from", name)
                       break
               except Exception as e:
                   print(name, "failed:", e)
-                  time.sleep(10)
+                  time.sleep(5)
           if not rows:
               raise SystemExit("All sources failed")
 
