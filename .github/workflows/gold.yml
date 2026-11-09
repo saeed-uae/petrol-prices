@@ -1,0 +1,287 @@
+name: Gold prices
+
+on:
+  schedule:
+    # كل ساعة (الدقيقة ١٧ عشان نبتعد عن زحمة الساعة)
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gold
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: pip install google-auth requests
+
+      - name: Update gold prices
+        env:
+          FIREBASE_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > /tmp/gold.py <<'PYEOF'
+          import json, os, sys, csv, io, datetime
+          
+          try:
+              import requests
+          except ImportError:  # للتجربة بدون نت
+              requests = None
+          
+          # ================= الإعدادات =================
+          OZ = 31.1034768          # جرام في الأونصة
+          AED_PER_USD = 3.6725     # الدرهم مربوط بالدولار
+          TOLA = 11.6638           # جرام في التولة (باكستان)
+          
+          # نسبة كل عيار من عيار ٢٤ (نفس نسب أسعار دبي المنشورة)
+          KARAT_RATIO = {"24": 1.0, "22": 0.9262, "21": 0.888, "18": 0.761}
+          
+          # فرق السعر المحلي عن العالمي (١ = نفس السعر العالمي). نعدله لو لقينا فرق ثابت
+          UAE_PREMIUM = 1.0
+          INDIA_DUTY = 1.06        # جمارك الذهب في الهند ٦٪ (الأسعار هناك تنعرض بدون ضريبة GST)
+          PK_PREMIUM = 1.0         # فرق سوق الذهب في باكستان عن العالمي (تقريبي)
+          
+          MOVE_ALERT_PCT = 1.5     # إشعار إذا تحرك الذهب أكثر من ١.٥٪ عن إغلاق أمس
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+          
+          now = datetime.datetime.utcnow() + datetime.timedelta(hours=4)   # وقت الإمارات
+          today = now.strftime("%Y-%m-%d")
+          
+          
+          def get(url, kind="json"):
+              if requests is None:
+                  return None
+              try:
+                  r = requests.get(url, headers=UA, timeout=25)
+                  if r.status_code != 200:
+                      print("HTTP", r.status_code, url)
+                      return None
+                  return r.json() if kind == "json" else r.text
+              except Exception as e:
+                  print("fetch failed", url, e)
+                  return None
+          
+          
+          def ok(v, lo, hi):
+              return isinstance(v, (int, float)) and lo < v < hi
+          
+          
+          # ================= السعر العالمي (٣ مصادر، نجرب واحد ورا الثاني) =================
+          def spot(metal):
+              sym = {"gold": ("XAU", "GC=F", "xauusd"), "silver": ("XAG", "SI=F", "xagusd")}[metal]
+              lo, hi = (500, 20000) if metal == "gold" else (5, 500)
+          
+              j = get(f"https://api.gold-api.com/price/{sym[0]}")
+              if j and ok(j.get("price"), lo, hi):
+                  return float(j["price"]), "gold-api"
+          
+              j = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym[1]}?range=1d&interval=1d")
+              try:
+                  p = j["chart"]["result"][0]["meta"]["regularMarketPrice"]
+                  if ok(p, lo, hi):
+                      return float(p), "yahoo"
+              except Exception:
+                  pass
+          
+              t = get(f"https://stooq.com/q/l/?s={sym[2]}&f=sd2t2ohlc&h&e=csv", kind="text")
+              try:
+                  row = list(csv.DictReader(io.StringIO(t)))[0]
+                  p = float(row["Close"])
+                  if ok(p, lo, hi):
+                      return p, "stooq"
+              except Exception:
+                  pass
+              return None, None
+          
+          
+          def fx():
+              j = get("https://open.er-api.com/v6/latest/USD")
+              try:
+                  r = j["rates"]
+                  if ok(r.get("INR"), 50, 200) and ok(r.get("PKR"), 150, 600):
+                      return {"INR": r["INR"], "PKR": r["PKR"]}
+              except Exception:
+                  pass
+              return None
+          
+          
+          def q(v, step=0.25):
+              return round(round(v / step) * step, 2)
+          
+          
+          def karats(usd_oz):
+              g24 = usd_oz * AED_PER_USD / OZ * UAE_PREMIUM
+              return {k: q(g24 * r) for k, r in KARAT_RATIO.items()}
+          
+          
+          # ================= تاريخ الأسعار (أول مرة نجيب ٥ سنين) =================
+          def load(path, default):
+              try:
+                  return json.load(open(path, encoding="utf-8"))
+              except Exception:
+                  return default
+          
+          
+          def backfill():
+              out = {}
+              for metal, sym in (("g", "GC=F"), ("s", "SI=F")):
+                  j = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1d")
+                  try:
+                      res = j["chart"]["result"][0]
+                      for ts, c in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]):
+                          if c is None:
+                              continue
+                          d = (datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=4)).strftime("%Y-%m-%d")
+                          out.setdefault(d, {})[metal] = c
+                  except Exception as e:
+                      print("backfill failed", sym, e)
+              rows = []
+              for d in sorted(out):
+                  g, s = out[d].get("g"), out[d].get("s")
+                  if g and s:
+                      rows.append([d, karats(g)["24"], round(s * AED_PER_USD / OZ, 3)])
+              return rows
+          
+          
+          def main():
+              gold, src = spot("gold")
+              silver, src2 = spot("silver")
+              if not gold or not silver:
+                  print("No price source worked")
+                  sys.exit(0)  # نخلي الملف القديم كما هو
+              print("gold", gold, src, "| silver", silver, src2)
+          
+              old = load("gold.json", {})
+              hist = load("gold_history.json", {"note": "", "d": []})
+              if len(hist.get("d", [])) < 30:
+                  rows = backfill()
+                  if rows:
+                      hist["d"] = rows
+          
+              k = karats(gold)
+              silver_g = round(silver * AED_PER_USD / OZ, 3)
+          
+              # سجل اليوم في التاريخ (نحدّث آخر سطر لو نفس اليوم)
+              d = hist["d"]
+              if d and d[-1][0] == today:
+                  d[-1] = [today, k["24"], silver_g]
+              else:
+                  d.append([today, k["24"], silver_g])
+              hist["d"] = d[-2000:]
+              hist["note"] = "[date, gold 24K AED/gram, silver AED/gram] — daily"
+          
+              # إغلاق أمس = آخر يوم قبل اليوم
+              prev_row = next((r for r in reversed(d) if r[0] < today), None)
+              prev24 = prev_row[1] if prev_row else k["24"]
+              prev_s = prev_row[2] if prev_row else silver_g
+          
+              # أسعار اليوم ساعة بساعة (للرسم اليومي)
+              hours = [h for h in old.get("hours", []) if h[0] >= (now - datetime.timedelta(hours=36)).strftime("%Y-%m-%d %H")]
+              stamp = now.strftime("%Y-%m-%d %H")
+              hours = [h for h in hours if h[0] != stamp] + [[stamp, k["24"]]]
+          
+              rates = fx() or old.get("fx")
+              home = None
+              if rates:
+                  inr_g = gold * rates["INR"] / OZ
+                  pkr_g = gold * rates["PKR"] / OZ
+                  home = {
+                      "india_24_10g": round(inr_g * 10 * INDIA_DUTY),          # روبية هندية لكل ١٠ جرام
+                      "india_22_10g": round(inr_g * 10 * INDIA_DUTY * 0.9167),
+                      "pak_24_tola": round(pkr_g * TOLA * PK_PREMIUM),         # روبية باكستانية للتولة
+                      "pak_22_tola": round(pkr_g * TOLA * PK_PREMIUM * 0.9167),
+                      # نفس السعر بالدرهم للجرام عشان نقارن
+                      "india_24_aed_g": round(inr_g * INDIA_DUTY / rates["INR"] * AED_PER_USD, 2),
+                      "pak_24_aed_g": round(pkr_g * PK_PREMIUM / rates["PKR"] * AED_PER_USD, 2),
+                  }
+          
+              data = {
+                  "updated": now.strftime("%Y-%m-%d %H:%M"),
+                  "source": src,
+                  "usd_oz": round(gold, 2),
+                  "silver_usd_oz": round(silver, 3),
+                  "k": k,
+                  "prev24": prev24,
+                  "silver_g": silver_g,
+                  "prev_silver_g": prev_s,
+                  "fx": rates,
+                  "home": home,
+                  "hours": hours,
+                  "alerted": old.get("alerted", {}),
+              }
+          
+              # ================= الإشعارات =================
+              messages = []
+              pct = (k["24"] - prev24) / prev24 * 100 if prev24 else 0
+              direction = "up" if pct > 0 else "down"
+              alerted = data["alerted"]
+              if abs(pct) >= MOVE_ALERT_PCT and alerted.get("move") != today + direction:
+                  alerted["move"] = today + direction
+                  arrow = "📈" if pct > 0 else "📉"
+                  word_ar = "ارتفع" if pct > 0 else "نزل"
+                  word_en = "up" if pct > 0 else "down"
+                  messages += [
+                      ("gold_move_ar", f"{arrow} الذهب {word_ar} {abs(pct):.1f}٪ اليوم",
+                       f"عيار ٢٤: {k['24']:.2f} درهم • عيار ٢٢: {k['22']:.2f} درهم"),
+                      ("gold_move_en", f"{arrow} Gold is {word_en} {abs(pct):.1f}% today",
+                       f"24K: AED {k['24']:.2f} • 22K: AED {k['22']:.2f}"),
+                  ]
+              # ملخص الصبح الساعة ٩ (للي مشترك فيه)
+              if now.hour == 9 and alerted.get("daily") != today:
+                  alerted["daily"] = today
+                  sign = "⬆️" if pct > 0 else ("⬇️" if pct < 0 else "➖")
+                  messages += [
+                      ("gold_daily_ar", f"☀️ سعر الذهب اليوم {sign}",
+                       f"عيار ٢٤: {k['24']:.2f} • ٢٢: {k['22']:.2f} • ٢١: {k['21']:.2f} درهم"),
+                      ("gold_daily_en", f"☀️ Gold price today {sign}",
+                       f"24K: {k['24']:.2f} • 22K: {k['22']:.2f} • 21K: {k['21']:.2f} AED"),
+                  ]
+          
+              json.dump(data, open("gold.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+              json.dump(hist, open("gold_history.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+              print("saved", k, "pct", round(pct, 2))
+          
+              if messages and os.environ.get("FIREBASE_KEY"):
+                  send(messages)
+          
+          
+          def send(messages):
+              from google.oauth2 import service_account
+              from google.auth.transport.requests import Request
+              info = json.loads(os.environ["FIREBASE_KEY"])
+              creds = service_account.Credentials.from_service_account_info(
+                  info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+              creds.refresh(Request())
+              url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
+              for topic, title, body in messages:
+                  r = requests.post(url, timeout=30, headers={"Authorization": "Bearer " + creds.token},
+                                    json={"message": {"topic": topic,
+                                                      "notification": {"title": title, "body": body},
+                                                      "android": {"priority": "HIGH", "notification": {"channel_id": "gold"}}}})
+                  print(topic, r.status_code, r.text[:200])
+          
+          
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -u /tmp/gold.py
+
+      - name: Save
+        run: |
+          git config user.name "gold-bot"
+          git config user.email "gold-bot@users.noreply.github.com"
+          git add gold.json gold_history.json
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git commit -m "Gold prices update"
+          git pull --rebase
+          git push
