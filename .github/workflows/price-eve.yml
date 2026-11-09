@@ -1,0 +1,93 @@
+name: Month-end notifications
+
+on:
+  schedule:
+    # ٩ الصبح بتوقيت الإمارات (٥ UTC): "صوّت" قبل آخر يوم بيوم
+    - cron: "0 5 27-30 * *"
+    # ٦ المغرب بتوقيت الإمارات (٢ الظهر UTC): "ترقبوا أسعار الليلة" آخر يوم
+    - cron: "0 14 28-31 * *"
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "vote أو tonight"
+        default: "tonight"
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: pip install google-auth requests
+
+      - name: Send notification
+        env:
+          FIREBASE_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          EVENT: ${{ github.event_name }}
+          KIND: ${{ github.event.inputs.kind }}
+        run: |
+          python3 -u - <<'EOF'
+          import json, os, sys, datetime, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+
+          AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"]
+          EN_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+
+          now = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
+          manual = os.environ.get("EVENT") == "workflow_dispatch"
+
+          # الصبح = تذكير التصويت، المغرب = ترقبوا أسعار الليلة
+          kind = os.environ.get("KIND") if manual else ("vote" if now.hour < 12 else "tonight")
+          if kind not in ("vote", "tonight"):
+              kind = "tonight"
+
+          # vote: لازم بكرة يكون آخر يوم في الشهر | tonight: لازم اليوم آخر يوم
+          days_ahead = 2 if kind == "vote" else 1
+          if (now + datetime.timedelta(days=days_ahead)).day != 1 and not manual:
+              print("Not the right day")
+              sys.exit(0)
+
+          nxt = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+          ar_name, en_name = AR_MONTHS[nxt.month - 1], EN_MONTHS[nxt.month - 1]
+          key = f"{nxt.year}-{nxt.month:02d}"
+
+          # إذا الأسعار نزلت أو انعلنت في الأخبار، ما نرسل
+          try:
+              p = json.load(open("prices.json", encoding="utf-8"))
+          except Exception:
+              p = {}
+          if not manual and (p.get("month", "").startswith(ar_name) or p.get("poll_closed") == key):
+              print("Prices already announced")
+              sys.exit(0)
+
+          if kind == "vote":
+              messages = [
+                  ("prices_ar", f"🗳️ برأيك، أسعار {ar_name} بترتفع ولا بتنخفض؟", "صوّت الحين وشوف توقعات الناس 👀"),
+                  ("prices_en", f"🗳️ Will {en_name} prices go up or down?", "Vote now and see what others expect 👀"),
+              ]
+          else:
+              messages = [
+                  ("prices_ar", f"⏰ ترقبوا أسعار {ar_name} الليلة!", "الأسعار الجديدة تنزل الليلة، وبيوصلك إشعار أول ما تنزل 🔔 (آخر فرصة للتصويت 🗳️)"),
+                  ("prices_en", f"⏰ {en_name} prices are out tonight!", "We'll notify you as soon as they're out 🔔 (last chance to vote 🗳️)"),
+              ]
+
+          info = json.loads(os.environ["FIREBASE_KEY"])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+          creds.refresh(Request())
+          url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
+          for topic, title, body in messages:
+              r = requests.post(url, timeout=30,
+                  headers={"Authorization": "Bearer " + creds.token},
+                  json={"message": {
+                      "topic": topic,
+                      "notification": {"title": title, "body": body},
+                      "android": {"priority": "HIGH", "notification": {"channel_id": "prices"}}
+                  }})
+              print(topic, r.status_code, r.text)
+              r.raise_for_status()
+          print("Done ✅", kind)
+          EOF

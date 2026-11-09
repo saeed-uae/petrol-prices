@@ -11,13 +11,13 @@ permissions:
 
 jobs:
   update:
-    if: github.event.issue.user.login == github.repository_owner
+    if: github.event.issue.user.login == github.repository_owner && !contains(github.event.issue.labels.*.name, 'price-alert')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update prices.json
+      - name: Update prices.json and history.json
         id: up
         env:
           BODY: ${{ github.event.issue.body }}
@@ -61,6 +61,7 @@ jobs:
           year = now.year + 1 if c < now.month - 1 else now.year
           month = f"{month_name} {year}"
 
+          # ١. prices.json
           data = json.load(open("prices.json", encoding="utf-8"))
           new_month = data.get("month") != month
           if new_month:
@@ -79,6 +80,19 @@ jobs:
           with open("prices.json", "w", encoding="utf-8") as f:
               json.dump(out, f, ensure_ascii=False, indent=2)
 
+          # ٢. history.json (تاريخ الأسعار): نضيف الشهر أو نصلّحه
+          key = f"{year}-{c:02d}"
+          try:
+              hist = json.load(open("history.json", encoding="utf-8"))
+          except Exception:
+              hist = {"months": []}
+          months = [m for m in hist.get("months", []) if m.get("m") != key]
+          months.append({"m": key, "p": prices})
+          months.sort(key=lambda m: m["m"])
+          hist["months"] = months
+          with open("history.json", "w", encoding="utf-8") as f:
+              json.dump(hist, f, ensure_ascii=False, separators=(",", ":"))
+
           lines = [f"✅ تم تحديث أسعار {month}", ""]
           for name, p in zip(NAMES, prices):
               lines.append(f"- {name}: {p:.2f}")
@@ -92,14 +106,23 @@ jobs:
         run: |
           git config user.name "prices-bot"
           git config user.email "prices-bot@users.noreply.github.com"
-          git add prices.json
-          git diff --cached --quiet || (git commit -m "Update prices" && git push)
+          git add prices.json history.json
+          git diff --cached --quiet || (git commit -m "Update prices" && git pull --rebase && git push)
 
       - name: Send notification
         if: steps.up.outputs.new_month == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run notify.yml --repo ${{ github.repository }}
+
+      - name: Close price alerts
+        if: steps.up.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --repo ${{ github.repository }} --label price-alert --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --repo ${{ github.repository }} --comment "✅ تم التحديث" || true
+          done
 
       - name: Reply and close
         if: always()

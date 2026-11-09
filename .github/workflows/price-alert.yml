@@ -1,0 +1,229 @@
+name: Price alert
+
+on:
+  schedule:
+    # كل ساعة، من يوم ٢٥ لين يوم ٢ في الشهر
+    - cron: "0 * 25-31 * *"
+    - cron: "0 * 1,2 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: pip install requests
+
+      - name: Look for new prices
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 -u - <<'EOF'
+          import json, os, re, sys, html, datetime, urllib.parse, subprocess
+          import requests
+
+          AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"]
+          EN_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+          REPO = os.environ.get("REPO", "")
+          OWNER = os.environ.get("OWNER", "")
+          LABEL = "price-alert"
+
+          now = datetime.datetime.utcnow() + datetime.timedelta(hours=4)  # وقت الإمارات
+          if now.day >= 25:
+              t = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+          else:
+              t = now.replace(day=1)
+          ar_name, en_name = AR_MONTHS[t.month - 1], EN_MONTHS[t.month - 1]
+          target_ar = f"{ar_name} {t.year}"
+          print("Looking for:", en_name, t.year)
+
+
+          def gh(*args):
+              return subprocess.run(["gh", *args, "--repo", REPO], capture_output=True, text=True)
+
+
+          # ١. إذا الأسعار محدثة أصلاً، ما نسوي شي
+          try:
+              current = json.load(open("prices.json", encoding="utf-8")).get("month", "")
+          except Exception:
+              current = ""
+          if current == target_ar:
+              print("Prices already updated for", target_ar)
+              sys.exit(0)
+
+          # ٢. إذا أرسلنا تنبيه لهالشهر من قبل، ما نكرر
+          title_key = f"{ar_name} {t.year}"
+          existing = gh("issue", "list", "--label", LABEL, "--state", "all", "--limit", "50", "--json", "title")
+          try:
+              old_titles = [i["title"] for i in json.loads(existing.stdout or "[]")]
+          except Exception:
+              old_titles = []
+          if any(title_key in x for x in old_titles):
+              print("Alert already sent")
+              sys.exit(0)
+
+
+          def fetch(url):
+              try:
+                  r = requests.get(url, headers=UA, timeout=25)
+                  if r.status_code == 200:
+                      return r.text
+              except Exception as e:
+                  print("fetch failed", url, e)
+              return ""
+
+
+          def clean(text):
+              text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return re.sub(r"\s+", " ", html.unescape(text))
+
+
+          FUEL_PATTERNS = [
+              r"super\s*98",
+              r"special\s*95",
+              r"e[\s\-]?plus(?:\s*91)?",
+              r"diesel",
+          ]
+
+
+          def extract_prices(text):
+              """يحاول يقرا الأسعار الأربعة من نص الخبر. يرجع None إذا مب متأكد."""
+              out = []
+              for pat in FUEL_PATTERNS:
+                  m = re.search(pat + r"[^0-9]{0,90}?(\d\.\d{2})", text, flags=re.I)
+                  if not m:
+                      return None
+                  out.append(float(m.group(1)))
+              s, sp, e, d = out
+              if not all(1 <= x <= 10 for x in out):
+                  return None
+              if not (s > sp > e):
+                  return None
+              return out
+
+
+          def is_relevant(title):
+              tl = title.lower()
+              return (("fuel" in tl or "petrol" in tl) and en_name.lower() in tl
+                      and ("uae" in tl or "emirates" in tl))
+
+
+          # ٣. ندوّر في أخبار Bing (روابط مباشرة للجرايد)
+          query = f"UAE petrol diesel prices {en_name} {t.year}"
+          rss = fetch("https://www.bing.com/news/search?format=rss&q=" + urllib.parse.quote(query))
+          items = re.findall(r"<item>(.*?)</item>", rss, flags=re.S)
+          found = []
+          for it in items:
+              title = html.unescape(re.sub(r"<.*?>", "", (re.search(r"<title>(.*?)</title>", it, re.S) or [None, ""])[1]))
+              link = html.unescape((re.search(r"<link>(.*?)</link>", it, re.S) or [None, ""])[1]).strip()
+              qs = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+              if "url" in qs:
+                  link = qs["url"][0]
+              if title and is_relevant(title):
+                  found.append((title, link))
+
+          # احتياط: أخبار قوقل (عناوين بس)
+          if not found:
+              rss = fetch("https://news.google.com/rss/search?hl=en-AE&gl=AE&ceid=AE:en&q=" + urllib.parse.quote(query + " when:5d"))
+              for it in re.findall(r"<item>(.*?)</item>", rss, flags=re.S):
+                  title = html.unescape((re.search(r"<title>(.*?)</title>", it, re.S) or [None, ""])[1])
+                  link = (re.search(r"<link>(.*?)</link>", it, re.S) or [None, ""])[1].strip()
+                  if title and is_relevant(title):
+                      found.append((title, link))
+
+          print("Relevant news:", found[:5])
+
+          # آخر يوم ٢ الساعة ٦ المغرب: لو ما لقينا شي، نذكّره على كل حال
+          give_up_reminder = (not found) and now.day == 2 and now.hour >= 18
+
+          if not found and not give_up_reminder:
+              print("Nothing yet")
+              sys.exit(0)
+
+          # الخبر نزل: نسكّر التصويت في البرنامج (عشان ما يصوّت أحد وهو عارف السعر)
+          if found:
+              try:
+                  poll_key = f"{t.year}-{t.month:02d}"
+                  pdata = json.load(open("prices.json", encoding="utf-8"))
+                  if pdata.get("poll_closed") != poll_key:
+                      pdata["poll_closed"] = poll_key
+                      with open("prices.json", "w", encoding="utf-8") as f:
+                          json.dump(pdata, f, ensure_ascii=False, indent=2)
+                      subprocess.run(["git", "config", "user.name", "prices-bot"])
+                      subprocess.run(["git", "config", "user.email", "prices-bot@users.noreply.github.com"])
+                      subprocess.run(["git", "commit", "-am", "Close poll"])
+                      subprocess.run(["git", "pull", "--rebase"])
+                      subprocess.run(["git", "push"])
+              except Exception as e:
+                  print("poll close failed", e)
+
+          # ٤. نحاول نقرا الأرقام من أول ٣ أخبار
+          prices = None
+          source = None
+          for title, link in found[:3]:
+              if "news.google.com" in link:
+                  continue
+              p = extract_prices(clean(fetch(link)))
+              if p:
+                  prices, source = p, link
+                  break
+
+          form = f"https://github.com/{REPO}/issues/new?template=prices.yml"
+          params = {"month": ar_name}
+          if prices:
+              params.update({"super98": f"{prices[0]:.2f}", "special95": f"{prices[1]:.2f}",
+                             "eplus91": f"{prices[2]:.2f}", "diesel": f"{prices[3]:.2f}"})
+          form_link = form + "&" + urllib.parse.urlencode(params)
+
+          lines = []
+          if prices:
+              lines += [
+                  f"## ⛽ أسعار {target_ar} نزلت!",
+                  "",
+                  "الروبوت قرا الأرقام من الخبر:",
+                  f"- سوبر 98: **{prices[0]:.2f}**",
+                  f"- خصوصي 95: **{prices[1]:.2f}**",
+                  f"- إي بلس 91: **{prices[2]:.2f}**",
+                  f"- ديزل: **{prices[3]:.2f}**",
+                  "",
+                  "⚠️ **تأكد من الأرقام بعينك** من الخبر قبل ما ترسل:",
+                  f"📰 {source}",
+                  "",
+                  f"### 👉 [افتح الفورم (الأرقام جاهزة)]({form_link})",
+                  "وبعدها اضغط **Create** ✅",
+              ]
+          elif found:
+              lines += [
+                  f"## ⛽ أسعار {target_ar} نزلت!",
+                  "",
+                  "ما قدرت أقرا الأرقام بروحي، شوفها من الخبر:",
+              ]
+              lines += [f"- 📰 [{tt}]({ll})" for tt, ll in found[:3]]
+              lines += ["", f"### 👉 [افتح الفورم]({form_link})", "واكتب الأرقام، وبعدها **Create** ✅"]
+          else:
+              lines += [
+                  f"## ⏰ تذكير: أسعار {target_ar}",
+                  "",
+                  "ما لقيت خبر الأسعار في الجرايد للحين. شيك في وام أو الأخبار،",
+                  f"### 👉 وبعدها [افتح الفورم]({form_link})",
+              ]
+          if OWNER:
+              lines += ["", f"@{OWNER}"]
+
+          open("alert.md", "w", encoding="utf-8").write("\n".join(lines))
+          gh("label", "create", LABEL, "--color", "FFC21A", "--description", "تنبيه نزول الأسعار")
+          title = f"🔔 أسعار {title_key} نزلت" if found else f"⏰ تذكير أسعار {title_key}"
+          r = gh("issue", "create", "--title", title, "--body-file", "alert.md", "--label", LABEL)
+          print(r.stdout, r.stderr)
+          EOF
