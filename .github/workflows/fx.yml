@@ -1,0 +1,273 @@
+name: Currency prices
+
+on:
+  schedule:
+    # ٦ مرات في اليوم (منها الساعة ٩:٣٧ الصبح بتوقيت الإمارات للملخص اليومي)
+    - cron: "37 1,5,9,13,17,21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fx
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: pip install google-auth requests
+
+      - name: Update currency prices
+        env:
+          FIREBASE_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > /tmp/fx.py <<'PYEOF'
+          import json, os, sys, datetime
+
+          try:
+              import requests
+          except ImportError:  # للتجربة بدون نت
+              requests = None
+
+          # ================= الإعدادات =================
+          AED_PER_USD = 3.6725     # الدرهم مربوط بالدولار
+
+          # العملات (كم تساوي ١ درهم) + أسماؤها للإشعارات
+          CUR = {
+              "INR": ("الروبية الهندية", "Indian Rupee", "روبية", "INR"),
+              "PKR": ("الروبية الباكستانية", "Pakistani Rupee", "روبية", "PKR"),
+              "PHP": ("البيسو الفلبيني", "Philippine Peso", "بيسو", "PHP"),
+              "BDT": ("التاكا البنغلاديشية", "Bangladeshi Taka", "تاكا", "BDT"),
+              "EGP": ("الجنيه المصري", "Egyptian Pound", "جنيه", "EGP"),
+              "NPR": ("الروبية النيبالية", "Nepalese Rupee", "روبية", "NPR"),
+              "LKR": ("الروبية السريلانكية", "Sri Lankan Rupee", "روبية", "LKR"),
+              "IDR": ("الروبية الإندونيسية", "Indonesian Rupiah", "روبية", "IDR"),
+              "AFN": ("الأفغاني", "Afghan Afghani", "أفغاني", "AFN"),
+              "JOD": ("الدينار الأردني", "Jordanian Dinar", "دينار", "JOD"),
+              "MAD": ("الدرهم المغربي", "Moroccan Dirham", "درهم مغربي", "MAD"),
+              "TND": ("الدينار التونسي", "Tunisian Dinar", "دينار", "TND"),
+              "KES": ("الشلن الكيني", "Kenyan Shilling", "شلن", "KES"),
+              "UGX": ("الشلن الأوغندي", "Ugandan Shilling", "شلن", "UGX"),
+              "ETB": ("البير الإثيوبي", "Ethiopian Birr", "بير", "ETB"),
+              "NGN": ("النايرا النيجيرية", "Nigerian Naira", "نايرا", "NGN"),
+              "CNY": ("اليوان الصيني", "Chinese Yuan", "يوان", "CNY"),
+              "TRY": ("الليرة التركية", "Turkish Lira", "ليرة", "TRY"),
+              "RUB": ("الروبل الروسي", "Russian Ruble", "روبل", "RUB"),
+              "SAR": ("الريال السعودي", "Saudi Riyal", "ريال", "SAR"),
+              "OMR": ("الريال العماني", "Omani Rial", "ريال", "OMR"),
+              "KWD": ("الدينار الكويتي", "Kuwaiti Dinar", "دينار", "KWD"),
+              "USD": ("الدولار الأمريكي", "US Dollar", "دولار", "USD"),
+              "EUR": ("اليورو", "Euro", "يورو", "EUR"),
+              "GBP": ("الجنيه الإسترليني", "British Pound", "جنيه", "GBP"),
+          }
+          CODES = list(CUR)
+
+          MOVE_ALERT_PCT = 1.0     # إشعار إذا تحرك الدرهم أكثر من ١٪ مقابل العملة عن إغلاق أمس
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+
+          now = datetime.datetime.utcnow() + datetime.timedelta(hours=4)   # وقت الإمارات
+          today = now.strftime("%Y-%m-%d")
+
+
+          def get(url):
+              if requests is None:
+                  return None
+              try:
+                  r = requests.get(url, headers=UA, timeout=25)
+                  if r.status_code != 200:
+                      print("HTTP", r.status_code, url)
+                      return None
+                  return r.json()
+              except Exception as e:
+                  print("fetch failed", url, e)
+                  return None
+
+
+          def r5(v):
+              # ٥ أرقام مهمة تكفي (مثلاً 24.123 أو 7654.3 أو 0.27229)
+              return float(f"{v:.5g}")
+
+
+          def good(rates):
+              return rates and all(isinstance(rates.get(c), (int, float)) and rates[c] > 0 for c in ("INR", "PKR", "PHP", "USD"))
+
+
+          # ================= الأسعار (مصدرين، نجرب واحد ورا الثاني) =================
+          def latest():
+              j = get("https://open.er-api.com/v6/latest/AED")
+              if j and j.get("result") == "success" and good(j.get("rates")):
+                  return {c: r5(j["rates"][c]) for c in CODES if c in j["rates"]}, "er-api"
+
+              j = get("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/aed.json")
+              try:
+                  r = {k.upper(): v for k, v in j["aed"].items()}
+                  if good(r):
+                      return {c: r5(r[c]) for c in CODES if c in r}, "currency-api"
+              except Exception:
+                  pass
+              return None, None
+
+
+          # ================= تاريخ الأسعار (أول مرة نجيب سنة من Yahoo) =================
+          def load(path, default):
+              try:
+                  return json.load(open(path, encoding="utf-8"))
+              except Exception:
+                  return default
+
+
+          def backfill():
+              out = {}
+              for c in CODES:
+                  if c == "USD":
+                      continue
+                  j = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{c}=X?range=1y&interval=1d")
+                  try:
+                      res = j["chart"]["result"][0]
+                      for ts, v in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]):
+                          if v is None or v <= 0:
+                              continue
+                          d = (datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=4)).strftime("%Y-%m-%d")
+                          out.setdefault(d, {})[c] = r5(v / AED_PER_USD)
+                  except Exception as e:
+                      print("backfill failed", c, e)
+              rows = []
+              for d in sorted(out):
+                  if d >= today or len(out[d]) < len(CODES) * 0.6:
+                      continue
+                  out[d]["USD"] = r5(1 / AED_PER_USD)
+                  rows.append([d] + [out[d].get(c) for c in CODES])
+              return rows
+
+
+          def main():
+              rates, src = latest()
+              if not rates:
+                  print("No price source worked")
+                  sys.exit(0)  # نخلي الملف القديم كما هو
+              print("source", src, "INR", rates.get("INR"), "PKR", rates.get("PKR"))
+
+              old = load("fx.json", {})
+              hist = load("fx_history.json", {"codes": CODES, "d": []})
+
+              # لو تغيرت قائمة العملات نعيد ترتيب التاريخ
+              if hist.get("codes") != CODES:
+                  oc = hist.get("codes", [])
+                  hist["d"] = [[r[0]] + [r[1 + oc.index(c)] if c in oc else None for c in CODES] for r in hist.get("d", [])]
+                  hist["codes"] = CODES
+
+              if len(hist["d"]) < 30:
+                  rows = backfill()
+                  if rows:
+                      hist["d"] = rows
+
+              # سجل اليوم (نحدّث آخر سطر لو نفس اليوم)
+              d = hist["d"]
+              row = [today] + [rates.get(c) for c in CODES]
+              if d and d[-1][0] == today:
+                  d[-1] = row
+              else:
+                  d.append(row)
+              hist["d"] = d[-800:]
+              hist["note"] = "[date, then how much 1 AED buys of each currency in 'codes'] — daily"
+
+              # إغلاق أمس = آخر يوم قبل اليوم
+              prev_row = next((r for r in reversed(d) if r[0] < today), None)
+              prev = {}
+              for i, c in enumerate(CODES):
+                  v = prev_row[1 + i] if prev_row else None
+                  prev[c] = v if v else rates.get(c)
+
+              data = {
+                  "updated": now.strftime("%Y-%m-%d %H:%M"),
+                  "source": src,
+                  "r": rates,
+                  "prev": prev,
+                  "alerted": old.get("alerted", {}),
+              }
+
+              # ================= الإشعارات (لكل عملة موضوع خاص) =================
+              messages = []
+              alerted = data["alerted"]
+              for c in CODES:
+                  now_v, prev_v = rates.get(c), prev.get(c)
+                  if not now_v or not prev_v:
+                      continue
+                  pct = (now_v - prev_v) / prev_v * 100
+                  name_ar, name_en, unit_ar, unit_en = CUR[c]
+                  inv = now_v < 1   # العملات الأغلى من الدرهم نعرضها بالعكس
+                  shown = 1 / now_v if inv else now_v
+                  line_ar = f"١ {unit_ar} = {shown:,.2f} درهم" if inv else f"١ درهم = {shown:,.2f} {unit_ar}"
+                  line_en = f"1 {unit_en} = AED {shown:,.2f}" if inv else f"1 AED = {shown:,.2f} {unit_en}"
+
+                  direction = "up" if pct > 0 else "down"
+                  if abs(pct) >= MOVE_ALERT_PCT and alerted.get(c) != today + direction:
+                      alerted[c] = today + direction
+                      if pct > 0:
+                          t_ar = f"📈 الدرهم ارتفع {abs(pct):.1f}٪ مقابل {name_ar}"
+                          b_ar = f"{line_ar} • وقت مناسب للتحويل 💸"
+                          t_en = f"📈 AED is up {abs(pct):.1f}% vs {name_en}"
+                          b_en = f"{line_en} • A good time to send money 💸"
+                      else:
+                          t_ar = f"📉 الدرهم انخفض {abs(pct):.1f}٪ مقابل {name_ar}"
+                          b_ar = line_ar
+                          t_en = f"📉 AED is down {abs(pct):.1f}% vs {name_en}"
+                          b_en = line_en
+                      messages += [(f"fx_{c}_ar", t_ar, b_ar), (f"fx_{c}_en", t_en, b_en)]
+
+                  # ملخص الصبح الساعة ٩ (للي مشترك فيه)
+                  if now.hour == 9 and alerted.get("daily_" + c) != today:
+                      alerted["daily_" + c] = today
+                      sign = "⬆️" if pct > 0.05 else ("⬇️" if pct < -0.05 else "➖")
+                      messages += [
+                          (f"fxd_{c}_ar", f"☀️ سعر {name_ar} اليوم {sign}", line_ar),
+                          (f"fxd_{c}_en", f"☀️ {name_en} today {sign}", line_en),
+                      ]
+
+              json.dump(data, open("fx.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+              json.dump(hist, open("fx_history.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+              print("saved", len(rates), "currencies,", len(messages), "messages")
+
+              if messages and os.environ.get("FIREBASE_KEY"):
+                  send(messages)
+
+
+          def send(messages):
+              from google.oauth2 import service_account
+              from google.auth.transport.requests import Request
+              info = json.loads(os.environ["FIREBASE_KEY"])
+              creds = service_account.Credentials.from_service_account_info(
+                  info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+              creds.refresh(Request())
+              url = f"https://fcm.googleapis.com/v1/projects/{info['project_id']}/messages:send"
+              for topic, title, body in messages:
+                  r = requests.post(url, timeout=30, headers={"Authorization": "Bearer " + creds.token},
+                                    json={"message": {"topic": topic,
+                                                      "notification": {"title": title, "body": body},
+                                                      "android": {"priority": "HIGH", "notification": {"channel_id": "fx"}}}})
+                  print(topic, r.status_code, r.text[:200])
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 -u /tmp/fx.py
+
+      - name: Save
+        run: |
+          git config user.name "fx-bot"
+          git config user.email "fx-bot@users.noreply.github.com"
+          git add fx.json fx_history.json
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git commit -m "Currency prices update"
+          git pull --rebase
+          git push
