@@ -167,8 +167,23 @@ jobs:
                   if rows:
                       hist["d"] = rows
 
-              # سجل اليوم (نحدّث آخر سطر لو نفس اليوم)
+              # مرة وحدة: نوحّد التاريخ القديم (من Yahoo) مع مصدرنا اليومي، عشان ما يطلع فرق كبير وهمي
               d = hist["d"]
+              if not hist.get("calibrated"):
+                  for i, c in enumerate(CODES):
+                      now_v = rates.get(c)
+                      last = next((r[1 + i] for r in reversed(d) if r[0] < today and r[1 + i]), None)
+                      if not now_v or not last:
+                          continue
+                      ratio = now_v / last
+                      if abs(ratio - 1) > 0.004:
+                          print("calibrate", c, round(ratio, 4))
+                          for r in d:
+                              if r[0] < today and r[1 + i]:
+                                  r[1 + i] = r5(r[1 + i] * ratio)
+                  hist["calibrated"] = True
+
+              # سجل اليوم (نحدّث آخر سطر لو نفس اليوم)
               row = [today] + [rates.get(c) for c in CODES]
               if d and d[-1][0] == today:
                   d[-1] = row
